@@ -450,7 +450,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == 'support_premium':
-        # Уведомляем админа о запросе на премиум
         if ADMIN_ID:
             try:
                 await context.bot.send_message(
@@ -531,8 +530,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_photo(partner_id, update.message.photo[-1].file_id, caption=update.message.caption)
             else:
                 await update.message.reply_text("❌ Фото только в Премиум!")
-        elif update.message.sticker:
-            await context.bot.send_sticker(partner_id, update.message.sticker.file_id)
     else:
         await update.message.reply_text(get_text(user_id, 'no_partner'), reply_markup=main_menu_keyboard())
 
@@ -581,7 +578,6 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(stats)
 
 async def give_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ручная активация премиума: /givepremium user_id дни"""
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
         return
@@ -643,7 +639,8 @@ async def main():
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
-    app.add_handler(MessageHandler(filters.TEXT | filters.VOICE | filters.PHOTO | filters.STICKER, message_handler))
+    # Убран filters.STICKER — не поддерживается в версии 21.4
+    app.add_handler(MessageHandler(filters.TEXT | filters.VOICE | filters.PHOTO, message_handler))
 
     port = int(os.getenv("PORT", 8080))
     render_url = os.getenv("RENDER_EXTERNAL_URL", "")
