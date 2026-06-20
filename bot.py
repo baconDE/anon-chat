@@ -1,7 +1,7 @@
 import os
 import logging
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from aiohttp import web
 from supabase import create_client, Client
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
@@ -50,7 +50,13 @@ def is_premium(user_id):
     user = get_user(user_id)
     if not user or not user.get('premium_until'):
         return False
-    return datetime.now() < datetime.fromisoformat(user['premium_until'])
+    try:
+        until = datetime.fromisoformat(user['premium_until'])
+        if until.tzinfo:
+            return datetime.now(timezone.utc) < until
+        return datetime.now() < until
+    except:
+        return False
 
 def get_daily_chats(user_id):
     user = get_user(user_id)
@@ -144,10 +150,17 @@ def add_payment(user_id, amount, stars, status):
 
 def activate_premium(user_id, days=30):
     user = get_user(user_id)
-    if user and user.get('premium_until') and datetime.now() < datetime.fromisoformat(user['premium_until']):
-        base = datetime.fromisoformat(user['premium_until'])
-    else:
-        base = datetime.now()
+    now = datetime.now(timezone.utc)
+    try:
+        if user and user.get('premium_until'):
+            base = datetime.fromisoformat(user['premium_until'])
+            if base.tzinfo is None:
+                base = base.replace(tzinfo=timezone.utc)
+            base = base if now < base else now
+        else:
+            base = now
+    except:
+        base = now
     premium_until = (base + timedelta(days=days)).isoformat()
     supabase.table('users').update({'premium_until': premium_until}).eq('telegram_id', user_id).execute()
 
@@ -168,14 +181,14 @@ TEXTS = {
         'search_cancelled': "🚫 Поиск отменён.",
         'search_timeout': "⏱ Собеседник не найден за 2 минуты. Попробуйте позже.",
         'limit_reached': "❌ Лимит чатов на сегодня (5/5).\n\n⭐ Купите Премиум для безлимитного общения!",
-        'premium_info': "⭐ Премиум — 500 ₸/мес\n\n✅ Безлимитные чаты\n✅ Фильтр по полу\n✅ Приоритет в очереди\n✅ Фото и голосовые",
+        'premium_info': "⭐ Премиум — 100 ⭐ (500 ₸)/мес\n\n✅ Безлимитные чаты\n✅ Фильтр по полу\n✅ Приоритет в очереди\n✅ Фото и голосовые",
         'premium_active': "✅ Премиум активен до: {}",
         'payment_success': "🎉 Премиум активирован! Приятного общения!",
         'profile': "👤 Ваш профиль:\nПол: {}\nВозраст: {}\nГород: {}\nЧатов сегодня: {}/{}\nВсего чатов: {}",
         'no_partner': "❌ У вас нет активного чата.",
         'language_changed': "✅ Язык изменён на русский.",
         'choose_language': "🌐 Выберите язык / Тілді таңдаңыз:",
-        'support_info': "💬 Для покупки Премиума напишите: {}\n\nСтоимость: 500 ₸/мес",
+        'support_info': "💬 Для покупки Премиума напишите: {}\n\nСтоимость: 100 ⭐ (500 ₸)/мес",
         'voice_premium': "❌ Голосовые — только для Премиум!\n⭐ /premium для покупки.",
         'photo_premium': "❌ Фото — только для Премиум!\n⭐ /premium для покупки.",
         'choose_partner': "Кого ищете?",
@@ -194,14 +207,14 @@ TEXTS = {
         'search_cancelled': "🚫 Іздеу тоқтатылды.",
         'search_timeout': "⏱ 2 минут ішінде сөйлескен табылмады.",
         'limit_reached': "❌ Бүгінгі лимит таусылды (5/5).\n\n⭐ Шексіз үшін Премиум сатып алыңыз!",
-        'premium_info': "⭐ Премиум — 500 ₸/ай\n\n✅ Шексіз чаттар\n✅ Жыныс сүзгісі\n✅ Басымдық\n✅ Фото және дауыс",
+        'premium_info': "⭐ Премиум — 100 ⭐ (500 ₸)/ай\n\n✅ Шексіз чаттар\n✅ Жыныс сүзгісі\n✅ Басымдық\n✅ Фото және дауыс",
         'premium_active': "✅ Премиум {} дейін белсенді",
         'payment_success': "🎉 Премиум белсендірілді! Сәтті сөйлесу!",
         'profile': "👤 Профильіңіз:\nЖыныс: {}\nЖас: {}\nҚала: {}\nБүгін: {}/{}\nБарлығы: {}",
         'no_partner': "❌ Белсенді чат жоқ.",
         'language_changed': "✅ Тіл қазақшаға ауыстырылды.",
         'choose_language': "🌐 Тілді таңдаңыз / Выберите язык:",
-        'support_info': "💬 Премиум үшін жазыңыз: {}\n\nБағасы: 500 ₸/ай",
+        'support_info': "💬 Премиум үшін жазыңыз: {}\n\nБағасы: 100 ⭐ (500 ₸)/ай",
         'voice_premium': "❌ Дауыс — тек Премиум!\n⭐ /premium",
         'photo_premium': "❌ Фото — тек Премиум!\n⭐ /premium",
         'choose_partner': "Кімді іздейсіз?",
@@ -457,7 +470,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             payload=f"premium_{user_id}_{int(datetime.now().timestamp())}",
             provider_token="",
             currency="XTR",
-            prices=[LabeledPrice("Премиум", 500)]
+            prices=[LabeledPrice("Премиум", 100)]
         )
 
     elif data == 'support_premium':
@@ -508,6 +521,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             if update.message.text:
                 await context.bot.send_message(partner_id, update.message.text)
+            elif update.message.sticker:
+                await context.bot.send_sticker(partner_id, update.message.sticker.file_id)
             elif update.message.voice:
                 if is_premium(user_id):
                     await context.bot.send_voice(partner_id, update.message.voice.file_id)
@@ -531,7 +546,7 @@ async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    add_payment(user_id, 500, 500, 'success')
+    add_payment(user_id, 500, 100, 'success')
     activate_premium(user_id, 30)
     await update.message.reply_text(get_text(user_id, 'payment_success'), reply_markup=main_menu_keyboard())
 
@@ -619,7 +634,7 @@ async def main():
     telegram_app.add_handler(CallbackQueryHandler(callback_handler))
     telegram_app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
     telegram_app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
-    telegram_app.add_handler(MessageHandler(filters.TEXT | filters.VOICE | filters.PHOTO, message_handler))
+    telegram_app.add_handler(MessageHandler(filters.TEXT | filters.VOICE | filters.PHOTO | filters.Sticker.ALL, message_handler))
 
     port = int(os.getenv("PORT", 8080))
     render_url = os.getenv("RENDER_EXTERNAL_URL", "")
