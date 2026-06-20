@@ -1,9 +1,9 @@
 import os
 import logging
-import sqlite3
 import asyncio
 from datetime import datetime, timedelta
 from aiohttp import web
+from supabase import create_client, Client
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, MessageHandler,
@@ -16,200 +16,140 @@ logger = logging.getLogger(__name__)
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")  # service_role ключ
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 telegram_app = None
-active_searches = {}  # user_id -> True (для отмены поиска)
+active_searches = {}  # user_id -> True
 
-# ============ БАЗА ДАННЫХ ============
-
-def init_db():
-    conn = sqlite3.connect('chatbot.db')
-    c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        gender TEXT,
-        age INTEGER,
-        city TEXT,
-        language TEXT DEFAULT 'ru',
-        premium_until TEXT,
-        chats_today INTEGER DEFAULT 0,
-        last_chat_date TEXT,
-        total_chats INTEGER DEFAULT 0,
-        created_at TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS queue (
-        user_id INTEGER PRIMARY KEY,
-        gender TEXT,
-        age INTEGER,
-        city TEXT,
-        looking_for TEXT,
-        joined_at TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS chats (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_a_id INTEGER,
-        user_b_id INTEGER,
-        started_at TEXT,
-        ended_at TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS payments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        amount INTEGER,
-        stars INTEGER,
-        status TEXT,
-        created_at TEXT
-    )""")
-    conn.commit()
-    conn.close()
+# ============ БАЗА ДАННЫХ (Supabase) ============
 
 def get_user(user_id):
-    conn = sqlite3.connect('chatbot.db')
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-    user = c.fetchone()
-    conn.close()
-    return user
+    result = supabase.table('users').select('*').eq('telegram_id', user_id).execute()
+    return result.data[0] if result.data else None
 
 def create_user(user_id, username):
-    conn = sqlite3.connect('chatbot.db')
-    c = conn.cursor()
-    now = datetime.now().isoformat()
-    c.execute("INSERT OR IGNORE INTO users (user_id, username, created_at) VALUES (?, ?, ?)",
-              (user_id, username, now))
-    conn.commit()
-    conn.close()
+    supabase.table('users').upsert({
+        'telegram_id': user_id,
+        'username': username,
+        'created_at': datetime.now().isoformat()
+    }, on_conflict='telegram_id').execute()
 
 def update_user_profile(user_id, gender=None, age=None, city=None, language=None):
-    conn = sqlite3.connect('chatbot.db')
-    c = conn.cursor()
-    if gender:
-        c.execute("UPDATE users SET gender = ? WHERE user_id = ?", (gender, user_id))
-    if age:
-        c.execute("UPDATE users SET age = ? WHERE user_id = ?", (age, user_id))
-    if city:
-        c.execute("UPDATE users SET city = ? WHERE user_id = ?", (city, user_id))
-    if language:
-        c.execute("UPDATE users SET language = ? WHERE user_id = ?", (language, user_id))
-    conn.commit()
-    conn.close()
+    data = {}
+    if gender: data['gender'] = gender
+    if age: data['age'] = age
+    if city: data['city'] = city
+    if language: data['language'] = language
+    if data:
+        supabase.table('users').update(data).eq('telegram_id', user_id).execute()
 
 def is_premium(user_id):
     user = get_user(user_id)
-    if not user or not user[6]:
+    if not user or not user.get('premium_until'):
         return False
-    return datetime.now() < datetime.fromisoformat(user[6])
+    return datetime.now() < datetime.fromisoformat(user['premium_until'])
 
 def get_daily_chats(user_id):
     user = get_user(user_id)
     if not user:
         return 0
     today = datetime.now().strftime('%Y-%m-%d')
-    if user[8] != today:
-        conn = sqlite3.connect('chatbot.db')
-        c = conn.cursor()
-        c.execute("UPDATE users SET chats_today = 0, last_chat_date = ? WHERE user_id = ?", (today, user_id))
-        conn.commit()
-        conn.close()
+    if user.get('last_chat_date') != today:
+        supabase.table('users').update({
+            'chats_today': 0,
+            'last_chat_date': today
+        }).eq('telegram_id', user_id).execute()
         return 0
-    return user[7] or 0
+    return user.get('chats_today') or 0
 
 def increment_chats(user_id):
-    conn = sqlite3.connect('chatbot.db')
-    c = conn.cursor()
     today = datetime.now().strftime('%Y-%m-%d')
-    c.execute("""UPDATE users SET chats_today = chats_today + 1,
-                 total_chats = total_chats + 1, last_chat_date = ?
-                 WHERE user_id = ?""", (today, user_id))
-    conn.commit()
-    conn.close()
+    user = get_user(user_id)
+    if user:
+        supabase.table('users').update({
+            'chats_today': (user.get('chats_today') or 0) + 1,
+            'total_chats': (user.get('total_chats') or 0) + 1,
+            'last_chat_date': today
+        }).eq('telegram_id', user_id).execute()
 
 def add_to_queue(user_id, gender, age, city, looking_for):
-    conn = sqlite3.connect('chatbot.db')
-    c = conn.cursor()
-    now = datetime.now().isoformat()
-    c.execute("""INSERT OR REPLACE INTO queue
-                 (user_id, gender, age, city, looking_for, joined_at)
-                 VALUES (?, ?, ?, ?, ?, ?)""",
-              (user_id, gender, age, city, looking_for, now))
-    conn.commit()
-    conn.close()
+    supabase.table('queue').upsert({
+        'user_id': user_id,
+        'gender': gender,
+        'age': age,
+        'city': city,
+        'looking_for': looking_for,
+        'joined_at': datetime.now().isoformat()
+    }, on_conflict='user_id').execute()
 
 def remove_from_queue(user_id):
-    conn = sqlite3.connect('chatbot.db')
-    c = conn.cursor()
-    c.execute("DELETE FROM queue WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
+    supabase.table('queue').delete().eq('user_id', user_id).execute()
 
 def find_partner(user_id, looking_for, is_premium_user):
-    conn = sqlite3.connect('chatbot.db')
-    c = conn.cursor()
     if is_premium_user and looking_for:
-        c.execute("""SELECT user_id FROM queue
-                     WHERE user_id != ? AND gender = ?
-                     ORDER BY joined_at LIMIT 1""", (user_id, looking_for))
+        result = (supabase.table('queue')
+                  .select('user_id')
+                  .neq('user_id', user_id)
+                  .eq('gender', looking_for)
+                  .order('joined_at')
+                  .limit(1)
+                  .execute())
     else:
-        c.execute("SELECT user_id FROM queue WHERE user_id != ? ORDER BY joined_at LIMIT 1",
-                  (user_id,))
-    partner = c.fetchone()
-    conn.close()
-    return partner[0] if partner else None
+        result = (supabase.table('queue')
+                  .select('user_id')
+                  .neq('user_id', user_id)
+                  .order('joined_at')
+                  .limit(1)
+                  .execute())
+    return result.data[0]['user_id'] if result.data else None
 
 def create_chat(user_a, user_b):
-    conn = sqlite3.connect('chatbot.db')
-    c = conn.cursor()
-    now = datetime.now().isoformat()
-    c.execute("INSERT INTO chats (user_a_id, user_b_id, started_at) VALUES (?, ?, ?)",
-              (user_a, user_b, now))
-    conn.commit()
-    conn.close()
+    supabase.table('chats').insert({
+        'user_a_id': user_a,
+        'user_b_id': user_b,
+        'started_at': datetime.now().isoformat()
+    }).execute()
 
 def get_partner(user_id):
-    conn = sqlite3.connect('chatbot.db')
-    c = conn.cursor()
-    c.execute("""SELECT user_a_id, user_b_id FROM chats
-                 WHERE (user_a_id = ? OR user_b_id = ?) AND ended_at IS NULL
-                 ORDER BY id DESC LIMIT 1""", (user_id, user_id))
-    chat = c.fetchone()
-    conn.close()
-    if chat:
-        return chat[1] if chat[0] == user_id else chat[0]
+    result = (supabase.table('chats')
+              .select('user_a_id,user_b_id')
+              .or_(f'user_a_id.eq.{user_id},user_b_id.eq.{user_id}')
+              .is_('ended_at', 'null')
+              .order('id', desc=True)
+              .limit(1)
+              .execute())
+    if result.data:
+        chat = result.data[0]
+        return chat['user_b_id'] if chat['user_a_id'] == user_id else chat['user_a_id']
     return None
 
 def end_chat(user_id):
-    conn = sqlite3.connect('chatbot.db')
-    c = conn.cursor()
-    now = datetime.now().isoformat()
-    c.execute("""UPDATE chats SET ended_at = ?
-                 WHERE (user_a_id = ? OR user_b_id = ?) AND ended_at IS NULL""",
-              (now, user_id, user_id))
-    conn.commit()
-    conn.close()
+    (supabase.table('chats')
+     .update({'ended_at': datetime.now().isoformat()})
+     .or_(f'user_a_id.eq.{user_id},user_b_id.eq.{user_id}')
+     .is_('ended_at', 'null')
+     .execute())
 
 def add_payment(user_id, amount, stars, status):
-    conn = sqlite3.connect('chatbot.db')
-    c = conn.cursor()
-    now = datetime.now().isoformat()
-    c.execute("INSERT INTO payments (user_id, amount, stars, status, created_at) VALUES (?, ?, ?, ?, ?)",
-              (user_id, amount, stars, status, now))
-    conn.commit()
-    conn.close()
+    supabase.table('payments').insert({
+        'user_id': user_id,
+        'amount': amount,
+        'stars': stars,
+        'status': status,
+        'created_at': datetime.now().isoformat()
+    }).execute()
 
 def activate_premium(user_id, days=30):
-    conn = sqlite3.connect('chatbot.db')
-    c = conn.cursor()
     user = get_user(user_id)
-    # Продлеваем от текущего срока если уже есть премиум
-    if user and user[6] and datetime.now() < datetime.fromisoformat(user[6]):
-        base = datetime.fromisoformat(user[6])
+    if user and user.get('premium_until') and datetime.now() < datetime.fromisoformat(user['premium_until']):
+        base = datetime.fromisoformat(user['premium_until'])
     else:
         base = datetime.now()
     premium_until = (base + timedelta(days=days)).isoformat()
-    c.execute("UPDATE users SET premium_until = ? WHERE user_id = ?", (premium_until, user_id))
-    conn.commit()
-    conn.close()
+    supabase.table('users').update({'premium_until': premium_until}).eq('telegram_id', user_id).execute()
 
 # ============ ТЕКСТЫ ============
 
@@ -270,7 +210,7 @@ TEXTS = {
 
 def get_text(user_id, key, *args):
     user = get_user(user_id)
-    lang = user[5] if user and user[5] else 'ru'
+    lang = user['language'] if user and user.get('language') else 'ru'
     text = TEXTS.get(lang, TEXTS['ru']).get(key, key)
     return text.format(*args) if args else text
 
@@ -327,15 +267,13 @@ def filter_gender_keyboard():
         [InlineKeyboardButton("🎲 Без разницы / Бәрібір", callback_data='look_any')]
     ])
 
-# ============ ПОИСК (FIX: цикл вместо рекурсии) ============
+# ============ ПОИСК ============
 
 def cancel_search(user_id):
-    """Отменяет поиск пользователя."""
     active_searches.pop(user_id, None)
     remove_from_queue(user_id)
 
 async def try_find_partner(bot, user_id, looking_for=None):
-    """Ищет партнёра в цикле. Максимум 2 минуты ожидания."""
     active_searches[user_id] = True
     max_wait = 120
     waited = 0
@@ -346,7 +284,6 @@ async def try_find_partner(bot, user_id, looking_for=None):
             partner_id = find_partner(user_id, looking_for, premium)
 
             if partner_id:
-                # Нашли — убираем обоих из поиска
                 active_searches.pop(user_id, None)
                 active_searches.pop(partner_id, None)
                 remove_from_queue(user_id)
@@ -370,7 +307,6 @@ async def try_find_partner(bot, user_id, looking_for=None):
     finally:
         active_searches.pop(user_id, None)
 
-    # Таймаут — партнёр не найден
     if waited >= max_wait:
         remove_from_queue(user_id)
         try:
@@ -379,7 +315,6 @@ async def try_find_partner(bot, user_id, looking_for=None):
             pass
 
 def start_search(bot, user_id, looking_for=None):
-    """Запускает поиск партнёра в фоне."""
     asyncio.create_task(try_find_partner(bot, user_id, looking_for))
 
 # ============ ОБРАБОТЧИКИ КОМАНД ============
@@ -400,7 +335,7 @@ async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
     user = get_user(user_id)
-    add_to_queue(user_id, user[2] if user else None, user[3] if user else None, user[4] if user else None, None)
+    add_to_queue(user_id, user.get('gender') if user else None, user.get('age') if user else None, user.get('city') if user else None, None)
     await update.message.reply_text(get_text(user_id, 'searching'))
     start_search(context.bot, user_id)
 
@@ -455,7 +390,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if premium:
             await query.edit_message_text(get_text(user_id, 'choose_partner'), reply_markup=filter_gender_keyboard())
         else:
-            add_to_queue(user_id, user[2] if user else None, user[3] if user else None, user[4] if user else None, None)
+            add_to_queue(user_id, user.get('gender') if user else None, user.get('age') if user else None, user.get('city') if user else None, None)
             await query.edit_message_text(get_text(user_id, 'searching'))
             start_search(context.bot, user_id)
 
@@ -464,7 +399,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if looking_for == 'any':
             looking_for = None
         user = get_user(user_id)
-        add_to_queue(user_id, user[2] if user else None, user[3] if user else None, user[4] if user else None, looking_for)
+        add_to_queue(user_id, user.get('gender') if user else None, user.get('age') if user else None, user.get('city') if user else None, looking_for)
         await query.edit_message_text(get_text(user_id, 'searching'))
         start_search(context.bot, user_id, looking_for)
 
@@ -478,7 +413,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
         user = get_user(user_id)
-        add_to_queue(user_id, user[2] if user else None, user[3] if user else None, user[4] if user else None, None)
+        add_to_queue(user_id, user.get('gender') if user else None, user.get('age') if user else None, user.get('city') if user else None, None)
         await query.edit_message_text(get_text(user_id, 'searching'))
         start_search(context.bot, user_id)
 
@@ -496,12 +431,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'profile':
         user = get_user(user_id)
         if user:
-            gender = user[2] or "—"
-            age = user[3] or "—"
-            city = user[4] or "—"
+            gender = user.get('gender') or "—"
+            age = user.get('age') or "—"
+            city = user.get('city') or "—"
             daily = get_daily_chats(user_id)
             limit = "∞" if is_premium(user_id) else "5"
-            total = user[9] or 0
+            total = user.get('total_chats') or 0
             await query.edit_message_text(
                 get_text(user_id, 'profile', gender, age, city, daily, limit, total),
                 reply_markup=main_menu_keyboard()
@@ -510,7 +445,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'premium':
         if is_premium(user_id):
             user = get_user(user_id)
-            until = datetime.fromisoformat(user[6]).strftime('%d.%m.%Y')
+            until = datetime.fromisoformat(user['premium_until']).strftime('%d.%m.%Y')
             await query.edit_message_text(get_text(user_id, 'premium_active', until), reply_markup=main_menu_keyboard())
         else:
             await query.edit_message_text(get_text(user_id, 'premium_info'), reply_markup=premium_keyboard())
@@ -556,7 +491,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    # Ввод города
     if context.user_data.get('setting_city'):
         city = update.message.text.strip()
         if len(city) > 50:
@@ -606,21 +540,17 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    conn = sqlite3.connect('chatbot.db')
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM users")
-    total_users = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM chats WHERE ended_at IS NULL")
-    active_chats = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM users WHERE premium_until > ?", (datetime.now().isoformat(),))
-    premium_users = c.fetchone()[0]
-    c.execute("SELECT SUM(amount) FROM payments WHERE status = 'success'")
-    total_earned = c.fetchone()[0] or 0
-    conn.close()
+    total_users = len(supabase.table('users').select('telegram_id').execute().data)
+    active_chats_count = len(supabase.table('chats').select('id').is_('ended_at', 'null').execute().data)
+    now = datetime.now().isoformat()
+    premium_users = len(supabase.table('users').select('telegram_id').gt('premium_until', now).execute().data)
+    payments = supabase.table('payments').select('amount').eq('status', 'success').execute().data
+    total_earned = sum(p['amount'] for p in payments) if payments else 0
+
     await update.message.reply_text(
         f"📊 Статистика:\n"
         f"👥 Пользователей: {total_users}\n"
-        f"💬 Активных чатов: {active_chats}\n"
+        f"💬 Активных чатов: {active_chats_count}\n"
         f"🔍 В поиске: {len(active_searches)}\n"
         f"⭐ Премиум: {premium_users}\n"
         f"💰 Заработано: {total_earned} ₸"
@@ -678,7 +608,6 @@ async def health_handler(request):
 
 async def main():
     global telegram_app
-    init_db()
 
     telegram_app = ApplicationBuilder().token(TOKEN).build()
     telegram_app.add_handler(CommandHandler("start", start))
